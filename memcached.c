@@ -198,31 +198,62 @@ static void stats_reset(void) {
     item_stats_reset();
 }
 
+/***
+ * 初始化配置参数
+ *
+ */
 static void settings_init(void) {
     settings.use_cas = true;
     settings.access = 0700;
+	
+	/* Memcached系统默认TCP端口 */
     settings.port = 11211;
+	
+	/* Memcached系统默认UDP端口 */
     settings.udpport = 11211;
+	
     /* By default this string should be NULL for getaddrinfo() */
+	/* IP地址和端口等信息 */
     settings.inter = NULL;
+	
     settings.maxbytes = 64 * 1024 * 1024; /* default is 64MB */
-    settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
-    settings.verbose = 0;
+    
+	/* 最大允许的连接数, 与内存相关 */
+	settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
+    
+	/* 打印信息级别 */
+	settings.verbose = 0;
     settings.oldest_live = 0;
     settings.evict_to_free = 1;       /* push old items out of cache when memory runs out */
-    settings.socketpath = NULL;       /* by default, not using a unix socket */
-    settings.factor = 1.25;
+    
+	/* unix域socket文件, 默认为NULL表示不启用unix域socket, 启用unix域socket可以优化本地通信 */
+	settings.socketpath = NULL;       /* by default, not using a unix socket */
+    
+	/* 下一个slabclass的slab页的chunk大小是上一个的factor倍大小 */
+	settings.factor = 1.25;
+	
+	/* 默认内存池中slab页面的chunk大小 */
     settings.chunk_size = 48;         /* space for a modest key and value */
+	
+	/* 默认工作线程数为4 */
     settings.num_threads = 4;         /* N workers */
     settings.num_threads_per_udp = 0;
     settings.prefix_delimiter = ':';
     settings.detail_enabled = 0;
     settings.reqs_per_event = 20;
+	
+	/* 传给listen函数的backlog值 */
     settings.backlog = 1024;
     settings.binding_protocol = negotiating_prot;
+	
+	/* 默认的slab页大小为1M */
     settings.item_size_max = 1024 * 1024; /* The famous 1MB upper limit. */
     settings.maxconns_fast = false;
     settings.hashpower_init = 0;
+	
+	/* 标记是否重新设置slab页的大小, 该标记为true时,
+	 * slab的大小由slabclass->size * slabclass->perslab计算获取
+	 */
     settings.slab_reassign = false;
     settings.slab_automove = 0;
 }
@@ -275,16 +306,31 @@ static int add_msghdr(conn *c)
  * Free list management for connections.
  */
 
+/* 空闲连接池指针数组, 可动态扩展 */
 static conn **freeconns;
+
+/* 空闲连接池可以容纳的总连接数 */
 static int freetotal;
+
+/* 空闲连接池中当前可以添加新空闲连接的槽位索引 */
 static int freecurr;
+
 /* Lock for connection freelist */
+/* 空闲连接池数组操作互斥锁 */
 static pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
 
-
+/****
+ * 初始化空闲连接池
+ */
 static void conn_init(void) {
+
+	/* 初始时可以容纳200个空闲连接 */
     freetotal = 200;
+	
+	/* 下一个可添加空闲连接的槽位的索引 */
     freecurr = 0;
+	
+	/* 分配200个槽位的空间 */
     if ((freeconns = calloc(freetotal, sizeof(conn *))) == NULL) {
         fprintf(stderr, "Failed to allocate connection structures\n");
     }
@@ -294,13 +340,25 @@ static void conn_init(void) {
 /*
  * Returns a connection from the freelist, if any.
  */
+ 
+/***
+ * 从空闲连接池中获取一个空闲连接, 如果没有了空闲连接, 则返回NULL
+ * @return: 成功返回空闲连接对象的指针, 失败返回NULL
+ */
 conn *conn_from_freelist() {
     conn *c;
 
+	/* 操作时需要先加锁, 以避免竞态 */
     pthread_mutex_lock(&conn_lock);
+	
+	/* freecurr第一个空槽位的索引, 也就是说freecurr前面的都是可以用的空闲连接, 
+	 * 所以如果freecurr=0, 表示空闲连接池为空, 也就是没有可用的空闲连接
+	 */
     if (freecurr > 0) {
+		/* 存在空闲连接, 则返回freecurr前的空闲连接, 这也相当于从空闲连接池中移除了这个连接 */
         c = freeconns[--freecurr];
     } else {
+		/* 不存在则返回NULL */
         c = NULL;
     }
     pthread_mutex_unlock(&conn_lock);
@@ -311,15 +369,30 @@ conn *conn_from_freelist() {
 /*
  * Adds a connection to the freelist. 0 = success.
  */
+ 
+/***
+ * 添加空闲连接到空闲连接池中
+ * @conn[IN]: 连接对象
+ * @return: 成功则返回false, 失败返回true
+ */
 bool conn_add_to_freelist(conn *c) {
     bool ret = true;
+	
+	/* 加锁操作, 多线程安全 */
     pthread_mutex_lock(&conn_lock);
+	
+	/* 如果空闲连接池未满, 则直接放入空闲连接池的下一个可用槽位 */
     if (freecurr < freetotal) {
         freeconns[freecurr++] = c;
         ret = false;
-    } else {
+    } 
+	else { /* 如果空闲连接池已满, 则尝试扩大空闲连接池槽位数 */
         /* try to enlarge free connections array */
+		
+		/* 尝试扩大时是以2倍扩大 */
         size_t newsize = freetotal * 2;
+		
+		/* 重新分配空间并复制原来的空闲连接数据 */
         conn **new_freeconns = realloc(freeconns, sizeof(conn *) * newsize);
         if (new_freeconns) {
             freetotal = newsize;
@@ -351,14 +424,21 @@ static const char *prot_text(enum protocol prot) {
 conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
-                struct event_base *base) {
+                struct event_base *base) 
+{
+	/* 从连接池中获取一个空闲连接, conn是Memcached内部对网络连接的一个封装 */
     conn *c = conn_from_freelist();
 
+	/* 连接池中没有空闲连接 */
     if (NULL == c) {
+	
+		/* 则创建新的连接*/
         if (!(c = (conn *)calloc(1, sizeof(conn)))) {
             fprintf(stderr, "calloc()\n");
             return NULL;
         }
+		
+		/* 跟踪信息 */
         MEMCACHED_CONN_CREATE(c);
 
         c->rbuf = c->wbuf = 0;
@@ -383,6 +463,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         c->iov = (struct iovec *)malloc(sizeof(struct iovec) * c->iovsize);
         c->msglist = (struct msghdr *)malloc(sizeof(struct msghdr) * c->msgsize);
 
+		/* 以上分配内存任何一个失败都整体失败 */
         if (c->rbuf == 0 || c->wbuf == 0 || c->ilist == 0 || c->iov == 0 ||
                 c->msglist == 0 || c->suffixlist == 0) {
             conn_free(c);
@@ -449,12 +530,24 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     c->noreply = false;
 
+	/* 设置该连接对应的事件, 主要设置文件描述符, 事件类型, 事件就绪回调等 */
     event_set(&c->event, sfd, event_flags, event_handler, (void *)c);
+	
+	/* 设置事件的event_base(libevent的Reactor组件) */
     event_base_set(base, &c->event);
     c->ev_flags = event_flags;
 
+	/* 将该socket(连接)对应的事件添加到事件循环中(libevent) */
     if (event_add(&c->event, 0) == -1) {
-        if (conn_add_to_freelist(c)) {
+	
+		/* 如果添加事件失败, 则将此连接归还连接池, 
+		 * 注意: conn_add_to_freelist函数返回true表示失败, false表示成功, 
+		 * 这个还是比较恶心人的, conn_add_to_freelist执行失败的唯一可能性就是
+		 * 内存不够用, 所以此时只能够丢弃这个连接对象(释放该连接对象的空间)
+		 */
+        if (conn_add_to_freelist(c)) 
+		{
+			/* 析构连接对象, 内存不足了, 唯一的办法就是释放对象 */
             conn_free(c);
         }
         perror("event_add");
@@ -466,11 +559,15 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     stats.total_conns++;
     STATS_UNLOCK();
 
+	/* 跟踪信息记录 */
     MEMCACHED_CONN_ALLOCATE(c->sfd);
 
     return c;
 }
 
+/***
+ * 清理连接对象, 一般使用完的连接重新放入空闲连接池之前要清理此连接对象
+ */
 static void conn_cleanup(conn *c) {
     assert(c != NULL);
 
@@ -510,6 +607,9 @@ static void conn_cleanup(conn *c) {
 /*
  * Frees a connection.
  */
+/***
+ * 释放连接对象, 即析构此对象
+ */
 void conn_free(conn *c) {
     if (c) {
         MEMCACHED_CONN_DESTROY(c);
@@ -531,23 +631,34 @@ void conn_free(conn *c) {
     }
 }
 
+/***
+ * 关闭连接 
+ */
 static void conn_close(conn *c) {
     assert(c != NULL);
 
     /* delete the event, the socket and the conn */
+	/* 从事件循环(libevent)中删除此连接对应的事件 */
     event_del(&c->event);
 
     if (settings.verbose > 1)
         fprintf(stderr, "<%d connection closed.\n", c->sfd);
 
     MEMCACHED_CONN_RELEASE(c->sfd);
+	
+	/* 关闭此连接对应的socket */
     close(c->sfd);
     pthread_mutex_lock(&conn_lock);
     allow_new_conns = true;
     pthread_mutex_unlock(&conn_lock);
+	
+	/* 清理此连接对象 */
     conn_cleanup(c);
 
     /* if the connection has big buffers, just free it */
+	/* 如果这个连接占据了很大的数据缓冲区, 则直接析构掉这个连接对象
+	 * 否则将该连接对象回收到空闲连接池中, 若回收失败, 则同样析构该连接对象
+	 */
     if (c->rsize > READ_BUFFER_HIGHWAT || conn_add_to_freelist(c)) {
         conn_free(c);
     }
@@ -567,9 +678,15 @@ static void conn_close(conn *c) {
  * This should only be called in between requests since it can wipe output
  * buffers!
  */
+ 
+/*
+ * 尝试
+ *
+ */
 static void conn_shrink(conn *c) {
     assert(c != NULL);
 
+	/* 如果是UDP协议, 则无需处理 */
     if (IS_UDP(c->transport))
         return;
 
@@ -4046,6 +4163,12 @@ static void drive_machine(conn *c) {
     return;
 }
 
+/*
+ * libevent事件回调函数的处理, 处理就绪的连接事件, 一般是客户端有数据请求到达
+ * @fd[IN]: 就绪的事件描述符
+ * @which[IN]: 就绪的事件类型
+ * @arg[IN]: 用户注册事件时传入的私有数据, 此处是事件对应的连接对象
+ */
 void event_handler(const int fd, const short which, void *arg) {
     conn *c;
 
@@ -4055,6 +4178,9 @@ void event_handler(const int fd, const short which, void *arg) {
     c->which = which;
 
     /* sanity */
+	/* 正常情况下, 这是不可能出现的情况, 除非添加事件的时候传入的私有数据不是此fd对应的连接
+	 * 这里大可以使用assert(fd == c->sfd);
+	 */
     if (fd != c->sfd) {
         if (settings.verbose > 0)
             fprintf(stderr, "Catastrophic: event fd doesn't match conn fd!\n");
@@ -4062,20 +4188,28 @@ void event_handler(const int fd, const short which, void *arg) {
         return;
     }
 
+	/* 逻辑业务状态机处理 */
     drive_machine(c);
 
     /* wait for next event */
     return;
 }
 
+/***
+ * 根据addrinfo信息, 创建一个socket
+ * @addrinfo[IN]: 地址信息
+ * @return: 成功返回创建的有效socket, 失败返回-1
+ */
 static int new_socket(struct addrinfo *ai) {
     int sfd;
     int flags;
 
+	/* 调用socket创建一个相应的socket */
     if ((sfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)) == -1) {
         return -1;
     }
 
+	/* 将socket设置为非阻塞模式 */
     if ((flags = fcntl(sfd, F_GETFL, 0)) < 0 ||
         fcntl(sfd, F_SETFL, flags | O_NONBLOCK) < 0) {
         perror("setting O_NONBLOCK");
@@ -4088,6 +4222,10 @@ static int new_socket(struct addrinfo *ai) {
 
 /*
  * Sets a socket's send buffer size to the maximum allowed by the system.
+ */
+/***
+ * 将socket的发送缓冲区设置为系统允许的最大值
+ * @sfd[IN]: 要设置的socket
  */
 static void maximize_sndbuf(const int sfd) {
     socklen_t intsize = sizeof(int);
@@ -4129,6 +4267,15 @@ static void maximize_sndbuf(const int sfd) {
  *        when they are successfully added to the list of ports we
  *        listen on.
  */
+ 
+/***
+ * 创建一个被动类型Tcp/Udp类型socket, 并绑定到一个特定端口
+ * @interface[IN]: 绑定到的宿主, 即IP地址(或者域名)
+ * @port[IN]: 绑定到的端口号
+ * @transport[IN]: 传输层协议, Tcp或者Udp
+ * @portnumber_file[IN]: 端口保存文件句柄, 每次Memcached实例成功绑定到一个端口, 就将该端口写入此文件
+ * @return: 成功返回0, 失败返回-1
+ */
 static int server_socket(const char *interface,
                          int port,
                          enum network_transport transport,
@@ -4144,12 +4291,16 @@ static int server_socket(const char *interface,
     int success = 0;
     int flags =1;
 
+	/* 传输层协议, UDP还是TCP */
     hints.ai_socktype = IS_UDP(transport) ? SOCK_DGRAM : SOCK_STREAM;
 
+	/* 如果端口为-1, 则将port设置为0, 表示让内核自行分配端口号 */
     if (port == -1) {
         port = 0;
     }
     snprintf(port_buf, sizeof(port_buf), "%d", port);
+	
+	/* 通过Ip地址(或者域名)和port填充hints */
     error= getaddrinfo(interface, port_buf, &hints, &ai);
     if (error != 0) {
         if (error != EAI_SYSTEM)
@@ -4161,6 +4312,8 @@ static int server_socket(const char *interface,
 
     for (next= ai; next; next= next->ai_next) {
         conn *listen_conn_add;
+		
+		/* 遍历getaddrinfo函数返回的ai信息, 创建socket, 直到成功为止 */
         if ((sfd = new_socket(next)) == -1) {
             /* getaddrinfo can return "junk" addresses,
              * we make sure at least one works before erroring.
@@ -4170,24 +4323,34 @@ static int server_socket(const char *interface,
                 perror("server_socket");
                 exit(EX_OSERR);
             }
+			/* 如果失败, 尝试下一个 */
             continue;
         }
-
+		
 #ifdef IPV6_V6ONLY
+		
+		/* 对于IPV6 */
         if (next->ai_family == AF_INET6) {
             error = setsockopt(sfd, IPPROTO_IPV6, IPV6_V6ONLY, (char *) &flags, sizeof(flags));
             if (error != 0) {
                 perror("setsockopt");
                 close(sfd);
+				
+				/* 如果失败, 尝试下一个 */
                 continue;
             }
         }
 #endif
 
+		/* 为socket设置SO_REUSEADDR选项 */
         setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
+		
+		/* 如果是采用UDP协议, 则最大化socket的发送缓冲区 */
         if (IS_UDP(transport)) {
             maximize_sndbuf(sfd);
-        } else {
+        } 
+		else /* 如果是采用TCP协议, 则为socket设置SO_KEEPALIVE, SO_LINGER及TCP_NODELAY选项 */
+		{
             error = setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
             if (error != 0)
                 perror("setsockopt");
@@ -4201,6 +4364,7 @@ static int server_socket(const char *interface,
                 perror("setsockopt");
         }
 
+		/* 绑定地址和端口号 */
         if (bind(sfd, next->ai_addr, next->ai_addrlen) == -1) {
             if (errno != EADDRINUSE) {
                 perror("bind()");
@@ -4209,15 +4373,26 @@ static int server_socket(const char *interface,
                 return 1;
             }
             close(sfd);
+			
+			/* 如果失败, 尝试下一个 */
             continue;
-        } else {
+        }
+		else
+		{
+			/* 成功绑定的个数 */
             success++;
+			
+			/* 如果是TCP协议, 则在此socket上启用监听 */
             if (!IS_UDP(transport) && listen(sfd, settings.backlog) == -1) {
                 perror("listen()");
                 close(sfd);
                 freeaddrinfo(ai);
                 return 1;
             }
+			
+			/* 如果端口保存文件句柄有效, 则保存相关信息到此文件中
+			 * 保存的格式为: UDP/TCP INET: d端口号或者 UDP/TCP INET6: 端口号 
+			 */
             if (portnumber_file != NULL &&
                 (next->ai_addr->sa_family == AF_INET ||
                  next->ai_addr->sa_family == AF_INET6)) {
@@ -4240,6 +4415,7 @@ static int server_socket(const char *interface,
             }
         }
 
+		/* 如果是UDP协议 */
         if (IS_UDP(transport)) {
             int c;
 
@@ -4266,20 +4442,40 @@ static int server_socket(const char *interface,
     return success == 0;
 }
 
+/***
+ * 创建TCP/UDP网络套接字, 绑定到给定端口, 并监听之
+ * @port[IN]: Tcp/Udp端口号
+ * @transport[IN]: 传输层协议, 即使用Tcp还是Udp协议
+ * @portnumber_file[IN]: 端口文件句柄
+ * @return: 成功返回0, 失败返回-1
+ */
 static int server_sockets(int port, enum network_transport transport,
-                          FILE *portnumber_file) {
-    if (settings.inter == NULL) {
+                          FILE *portnumber_file) 
+{
+	/* settings.inter指定的是要绑定的ip地址信息, 如果为空, 则表示是绑定本机一个ip */
+    if (settings.inter == NULL)
+	{
         return server_socket(settings.inter, port, transport, portnumber_file);
-    } else {
+    }
+	else
+	{
+		/* 如果服务器有多个ip信息, 可以在每个(ip, port)上面绑定一个Memcached实例,
+		 * 下面是一些输入参数的解析, 解析完毕之后, 执行绑定
+		 */
         // tokenize them and bind to each one of them..
         char *b;
         int ret = 0;
+		
+		/* 复制setting.inter的信息(注意strdup内部会分配内存) */
         char *list = strdup(settings.inter);
 
+		/* 分配内存失败 */
         if (list == NULL) {
             fprintf(stderr, "Failed to allocate memory for parsing server interface string\n");
             return 1;
         }
+		
+		/* 开始解析 */
         for (char *p = strtok_r(list, ";,", &b);
              p != NULL;
              p = strtok_r(NULL, ";,", &b)) {
@@ -4296,13 +4492,20 @@ static int server_sockets(int port, enum network_transport transport,
             if (strcmp(p, "*") == 0) {
                 p = NULL;
             }
+			
+			/* 解析出一个Ip和端口号则绑定一个socket */
             ret |= server_socket(p, the_port, transport, portnumber_file);
         }
+		
+		/* 一定记得释放list的内存 */
         free(list);
         return ret;
     }
 }
 
+/***
+ * 创建一个unix域的流式非阻塞socket
+ */
 static int new_socket_unix(void) {
     int sfd;
     int flags;
@@ -4321,6 +4524,12 @@ static int new_socket_unix(void) {
     return sfd;
 }
 
+/***
+ * 创建unix域被动socket, 并监听该socket
+ * @path[IN]: unix域路径
+ * @access_mask[IN]:
+ * @return: 成功返回0, 失败返回非0值
+ */
 static int server_socket_unix(const char *path, int access_mask) {
     int sfd;
     struct linger ling = {0, 0};
@@ -4329,10 +4538,12 @@ static int server_socket_unix(const char *path, int access_mask) {
     int flags =1;
     int old_umask;
 
+	/* unix域路径必须设置 */
     if (!path) {
         return 1;
     }
 
+	/* 创建unix域socket */
     if ((sfd = new_socket_unix()) == -1) {
         return 1;
     }
@@ -4340,13 +4551,56 @@ static int server_socket_unix(const char *path, int access_mask) {
     /*
      * Clean up a previous socket file if we left it around
      */
+	/* 如果之前使用过该路径创建了一个unix域socket, 则需要先删除该文件或者去除连接,
+	 * 具体做法是: 获取该文件的状态, 如果获取失败, 说明该文件不存在, 无需处理,
+	 * 如果获取成功, 判断该文件是否为一个socket类型文件, 如果是, 则删除该文件或者删除连接
+	 */
     if (lstat(path, &tstat) == 0) {
         if (S_ISSOCK(tstat.st_mode))
             unlink(path);
     }
-
+	
+	/* 为socket设置SO_REUSEADDR选项, 一般服务器端都使用该选项, 其作用如下:
+	 *
+	 * 如果服务器出现意外而导致没有将服务器监听的端口释放, 那么服务器重新启动后, 
+	 * 你还可以用这个端口, 因为你已经规定可以重用了, 如果你没定义的话, 就会得到端口已占用的错误
+	 *
+	 * SO_REUSEADDR使用的场景在<<Unix网络编程>>卷1(UNPv1)中有所阐述:
+	 * 1) 当有一个有相同本地地址和端口的socket1处于TIME_WAIT状态时, 而你启动的程序的socket2要占用该地址和端口.
+	 * 2) SO_REUSEADDR允许同一port上启动同一服务器的多个实例(多个进程). 但每个实例绑定的IP地址是不能相同的(多宿主机)
+	 * 3) SO_REUSEADDR允许单个进程绑定相同的端口到多个socket上, 但每个socket绑定的ip地址不同
+	 * 4) SO_REUSEADDR允许完全相同的地址和端口的重复绑定. 但这只用于UDP的多播, 不用于TCP
+	 */
     setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (void *)&flags, sizeof(flags));
+	
+	/* 为socket设置SO_KEEPALIVE选项, 主要是为了检测客户端是否掉线
+	 *
+	 * UNPv1中对SO_KEEPALIVE选项也有详细的描述：
+	 * SO_KEEPALIVE保持连接检测对方主机是否崩溃, 避免(服务器)永远阻塞于TCP连接的输入。
+	 * 设置该选项后, 如果2小时(默认值)内在此套接口的任一方向都没有数据交换, TCP就自动给对方
+	 * 发一个保持存活探测分节(keepalive probe)。这是一个对方必须响应的TCP分节。它会导致以下三种情况：
+	 * 1) 对方接收一切正常：以期望的ACK响应。2小时后, TCP将发出另一个探测分节。
+	 * 2) 对方已崩溃且已重新启动: 以RST响应。套接口的待处理错误被置为ECONNRESET, 套接口本身则被关闭。
+	 * 3) 对方无任何响应: 源自berkeley的TCP发送另外8个探测分节, 相隔75秒一个, 试图得到一个响应。
+	 *    在发出第一个探测分节11分钟15秒后若仍无响应就放弃。套接口的待处理错误被置为ETIMEOUT, 
+	 *	  套接口本身则被关闭。
+	 * 如ICMP错误是"host unreachable(主机不可达)", 说明对方主机并没有崩溃, 但是不可达, 
+	 * 这种情况下待处理错误被置为EHOSTUNREACH
+	 */
     setsockopt(sfd, SOL_SOCKET, SO_KEEPALIVE, (void *)&flags, sizeof(flags));
+	
+	/* 为scoket设置SO_LINGER选项
+	 *
+	 * 1) 若设置了SO_LINGER(亦即linger结构中的l_onoff域设为非零), 并设置了零超时间隔,
+	 * 	  则closesocket()不被阻塞立即执行, 不论是否有排队数据未发送或未被确认.
+	 *    这种关闭方式称为“强制”或“失效”关闭, 因为套接口的虚电路立即被复位, 且丢失了未发送的数据。
+	 *    它可以避免端口的状态进入TIME_WAIT状态, 在远端的recv()调用将以WSAECONNRESET出错。
+	 *	  但是避免进入TIME_WAIT状态很可能导致客户端产生问题, TIME_WAIT的作用是保证在主动关闭端口后, 
+	 *	  保证数据让对端收到, Richard.Steven的说"TIME_WAIT是我们的朋友"
+	 * 2) 若设置了SO_LINGER并确定了非零的超时间隔, 则closesocket()调用阻塞进程, 直到所剩数据发送完毕或超时。
+	 *    这种关闭称为"优雅的"关闭。请注意如果套接口置为非阻塞且SO_LINGER设为非零超时，
+	 *    则closesocket()调用将以WSAEWOULDBLOCK错误返回。
+	 */
     setsockopt(sfd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
 
     /*
@@ -4355,17 +4609,28 @@ static int server_socket_unix(const char *path, int access_mask) {
      */
     memset(&addr, 0, sizeof(addr));
 
+	/* 填充unix域地址 */
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
     assert(strcmp(addr.sun_path, path) == 0);
+	
+	/* 设置创建文件的权限掩码, 因为调用bind时, 对于unix域socket, 会创建指定的socket文件
+	 * 所以bind调用前暂时以给定的access_mode设置权限掩码 
+	 */
     old_umask = umask( ~(access_mask&0777));
     if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
         perror("bind()");
+		
+		/* bind失败, 关闭创建的socket */
         close(sfd);
         umask(old_umask);
         return 1;
     }
+	
+	/* bind调用完成后, 恢复之前的mask */
     umask(old_umask);
+	
+	/* 监听该unix域套接字 */
     if (listen(sfd, settings.backlog) == -1) {
         perror("listen()");
         close(sfd);
@@ -4697,6 +4962,7 @@ static bool sanitycheck(void) {
 int main (int argc, char **argv) {
     int c;
     bool lock_memory = false;
+	
     bool do_daemonize = false;
     bool preallocate = false;
     int maxcore = 0;
@@ -4746,6 +5012,9 @@ int main (int argc, char **argv) {
     setbuf(stderr, NULL);
 
     /* process arguments */
+	/*
+	 * 解析命令行参数, 赋值给setting全局配置
+	 */
     while (-1 != (c = getopt(argc, argv,
           "a:"  /* access mask for unix socket */
           "p:"  /* TCP port number to listen on */
@@ -5154,8 +5423,14 @@ int main (int argc, char **argv) {
     clock_handler(0, 0, 0);
 
     /* create unix mode sockets after dropping privileges */
+	/* 如果设置了socketpath, 则表示使用unix域socket, 而非TCP/UDP socket
+	 * 注意: 如果确定memcached与客户程序都运行于本地机器, 则可以使用unxi域,
+	 * 这样通信不需要走网络, 可以提高通讯效率
+	 */
     if (settings.socketpath != NULL) {
         errno = 0;
+		
+		/* 创建unix域监听套接字, 并监听*/
         if (server_socket_unix(settings.socketpath,settings.access)) {
             vperror("failed to listen on UNIX socket: %s", settings.socketpath);
             exit(EX_OSERR);
@@ -5163,11 +5438,15 @@ int main (int argc, char **argv) {
     }
 
     /* create the listening socket, bind it, and init */
+	/* 如果没有设置unix域套接字文件路径, 则创建网络域套接字 */
     if (settings.socketpath == NULL) {
+	
+		/* 从环境变量MEMCACHED_PORT_FILENAME指定的环境变量得到端口号文件 */
         const char *portnumber_filename = getenv("MEMCACHED_PORT_FILENAME");
         char temp_portnumber_filename[PATH_MAX];
         FILE *portnumber_file = NULL;
 
+		/* 如果设置了该环境变量, 则打开该文件 */
         if (portnumber_filename != NULL) {
             snprintf(temp_portnumber_filename,
                      sizeof(temp_portnumber_filename),
@@ -5181,6 +5460,8 @@ int main (int argc, char **argv) {
         }
 
         errno = 0;
+		
+		/* settings.port表示Memcached采用的是TCP协议, 则创建TCP Socket监听并且绑定 */
         if (settings.port && server_sockets(settings.port, tcp_transport,
                                            portnumber_file)) {
             vperror("failed to listen on TCP port %d", settings.port);
@@ -5196,6 +5477,8 @@ int main (int argc, char **argv) {
 
         /* create the UDP listening socket and bind it */
         errno = 0;
+		
+		/* settings.udpport表示Memcached采用的是UDP协议, 则创建UDP Socket监听并且绑定 */
         if (settings.udpport && server_sockets(settings.udpport, udp_transport,
                                               portnumber_file)) {
             vperror("failed to listen on UDP port %d", settings.udpport);
@@ -5204,6 +5487,8 @@ int main (int argc, char **argv) {
 
         if (portnumber_file) {
             fclose(portnumber_file);
+			
+			/* 重命名端口文件 */
             rename(temp_portnumber_filename, portnumber_filename);
         }
     }

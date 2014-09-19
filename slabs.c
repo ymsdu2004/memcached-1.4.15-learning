@@ -39,7 +39,7 @@ typedef struct {
 	/* 当前slots链表中有多少个回收而来的空闲item */
     unsigned int sl_curr;   /* total free items in list */
 
-	/* 当前已使用的slab_list指针数组数量 */
+	/* 已经为此slabclass分配的slab数目 */
     unsigned int slabs;     /* how many slabs were allocated for this class */
 
 	/* 初始时, memcached 为每个slabclass分配一个slab, 当这个slab内存块使用完后,
@@ -48,33 +48,41 @@ typedef struct {
 	 */
     void **slab_list;       /* array of slab pointers */
 	
-	/* 当前slabclass有多少个slab(即slab_list数组当前元素的个数) */
+	/* slab_list数组的大小(这个大小可以改变, 如果要新增slab, 而slab_size不足时, 就会调用grow_slab_list扩容) */
     unsigned int list_size; /* size of prev array */
 
     unsigned int killing;  /* index+1 of dying slab, or zero if none */
 	
-	/* 已使用的内存大小 */
+	/* 该slabclass已被申请出去的内存 */
     size_t requested; /* The number of requested bytes */
 } slabclass_t;
 
 /* 索引0对应的元素不使用 */
 static slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
+
+/* memcached限制的最大使用内存数, 在slabs_init中设置, 如果该值设为0, 则不限制 */
 static size_t mem_limit = 0;
+
+/* memcached系统已经分配出去的内存大小 */
 static size_t mem_malloced = 0;
+
+/* slabclass的最大索引号 */
 static int power_largest;
 
-/* memcached整个内存块的地址 */
+/* 预先分配的memcached整个大内存块的地址 */
 static void *mem_base = NULL;
 
-/* */
+/* 预先分配的大内存块下次分配空间的起始地址 */
 static void *mem_current = NULL;
 
-/* memcached当前可用内存的大小 */
+/* 预先分配的大内存剩余可分配的内存数 */
 static size_t mem_avail = 0;
 
 /**
  * Access to the slab allocator is protected by this lock
  */
+ 
+/* slab操作互斥锁 */
 static pthread_mutex_t slabs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t slabs_rebalance_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -104,7 +112,7 @@ static void slabs_preallocate (const unsigned int maxslabs);
 /***
  * 返回给定大小的对象(chunk大小)应该存储在slabclass数组中的索引
  * @size[IN]: 需要存储的对象的大小
- * @return: 成功则返回相应slabclass的索引, 失败则返回0
+ * @return: 成功则返回相应slabclass的索引, 失败则返回0, slabclass数组中的0索引是不使用的
  */
 unsigned int slabs_clsid(const size_t size) {
     int res = POWER_SMALLEST;
@@ -113,9 +121,9 @@ unsigned int slabs_clsid(const size_t size) {
     if (size == 0)
         return 0;
 		
-	/* 逐个遍历slabclass, 找到第一个能够容纳的chunk的大小大于等于size的slabclass项 */
+	/* 逐个遍历slabclass, 最适合size大小对象的slabclass(即不小于size的拥有最小chunk尺寸的slabclass) */
     while (size > slabclass[res].size)
-		/* 请求的对象内存过大, 当前memcached的设置条件无法满足 */
+		/* 请求的对象内存过大, 超过了拥有最大Chunk尺寸的slabclass, 当前memcached的设置条件无法满足 */
         if (res++ == power_largest)     /* won't fit in the biggest slab */
             return 0;
 			
@@ -130,16 +138,17 @@ unsigned int slabs_clsid(const size_t size) {
 void slabs_init(const size_t limit, const double factor, const bool prealloc) {
     int i = POWER_SMALLEST - 1;
 	
-	/* 初始chunk块大小 */
+	/* 初始chunk块大小, 每个Chunk块都有额外的item, 用于链表链接 */
     unsigned int size = sizeof(item) + settings.chunk_size;
 
+	/* 用于限定memcached可分配的最大内存数 */
     mem_limit = limit;
 
-	/* 如果需要预先分配 */
+	/* 如果指定了为memcached预先分配大内存的的标志 */
     if (prealloc) {
         /* Allocate everything in a big chunk with malloc */
 		
-		/* 调用malloc依次分配mem_limit大小的内存块 */
+		/* 调用malloc分配mem_limit大小的大内存块 */
         mem_base = malloc(mem_limit);
         if (mem_base != NULL) {
             mem_current = mem_base;
@@ -178,7 +187,7 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc) {
 	/* 对大的chunk块对应的slabclass */
     power_largest = i;
 	
-	/* 它对应的chunk的小为item_size_max */
+	/* 它对应的chunk的大小为item_size_max */
     slabclass[power_largest].size = settings.item_size_max;
 	
 	/* 它的每个slab只有一个chunk块 */
@@ -199,10 +208,14 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc) {
 
 	/* 如果指定了预先分配内存 */
     if (prealloc) {
+		/* 为每个slabclass都预先分配一个slab */
         slabs_preallocate(power_largest);
     }
 }
 
+/***
+ * 为每个slabclass预先分配一个slab
+ */
 static void slabs_preallocate (const unsigned int maxslabs) {
     int i;
     unsigned int prealloc = 0;
@@ -212,6 +225,9 @@ static void slabs_preallocate (const unsigned int maxslabs) {
        messages.  this is the most common question on the mailing
        list.  if you really don't want this, you can rebuild without
        these three lines.  */
+	/***
+	 * 为每个slabclass预先分配默认大小为1M的slab
+	 */
 
     for (i = POWER_SMALLEST; i <= POWER_LARGEST; i++) {
         if (++prealloc > maxslabs)
@@ -227,16 +243,23 @@ static void slabs_preallocate (const unsigned int maxslabs) {
 }
 
 /***
- * 
+ * 如有必要, 尝试增加slab_list数组的大小, 以容纳新增slab的指针
  */
 static int grow_slab_list (const unsigned int id) {
 	
 	/* 索引到id对应的slabclass元素 */
     slabclass_t *p = &slabclass[id];
 	
-	/* 如果当前已经使用的slabs数量已经达到slab数组最大值*/
-    if (p->slabs == p->list_size) {
+	/* 如果当前已经使用的slabs数量已经达到slab数组最大值, 则对slab_list扩容 
+	 * 注意: 如果slab_list之前大小为0, 则将slab_list大小增至16个槽位, 否则
+	 * 数组槽位倍增
+	 */
+    if (p->slabs == p->list_size) 
+	{
+		/* 计算slab_list本次应该新增多少槽位 */
         size_t new_size =  (p->list_size != 0) ? p->list_size * 2 : 16;
+		
+		/* 扩大或者重新分配空间*/
         void *new_list = realloc(p->slab_list, new_size * sizeof(void *));
         if (new_list == 0) return 0;
         p->list_size = new_size;
@@ -245,17 +268,27 @@ static int grow_slab_list (const unsigned int id) {
     return 1;
 }
 
+/***
+ * 将新分配的一个完整slab页分割并加链接到空闲链表中
+ */
 static void split_slab_page_into_freelist(char *ptr, const unsigned int id) {
     slabclass_t *p = &slabclass[id];
     int x;
+	
+	/* 该slab页总共划分为perslab个chunk, 每个chunk通过item链接成一个链表 */
     for (x = 0; x < p->perslab; x++) {
+	
+		/* 将ptr指定的item(含chunk)链接到空闲链表中 */
         do_slabs_free(ptr, 0, id);
+		
+		/* 下一个item(chunk) */
         ptr += p->size;
     }
 }
 
 /***
- * 为slabclass[id]分配slab内存
+ * 为slabclass[id]分配slab内存, 当slabclass的slab用尽的时候, 调用该函数
+ * 为该slabclass非配一个新的slab
  */
 static int do_slabs_newslab(const unsigned int id) {
 
@@ -267,8 +300,11 @@ static int do_slabs_newslab(const unsigned int id) {
         : p->size * p->perslab;
     char *ptr;
 
-	/* 如果设置了mem_limit(初始化的时候指定), 并且再分配len大小内存是会导致超过mem_limit的限制, 并且已经分配过slabs,则失败
-	 **/
+	/* 1) 如果设置了mem_limit(初始化的时候指定), 并且再分配len大小内存是会导致超过mem_limit的限制, 并且已经分配过slabs
+	 * 2) 分配新的slab需要把slab的地址安插到slab_list数组中, 如果它容量不足, grow_slab_list尝试为对slab_list扩容
+	 * 3) 从预先分配的内存中取出1M大小的空闲块作为新分配的空闲slab
+	 * 条件1)满足, 或者执行动作2)和3)失败, 则do_slabs_newslab执行失败
+	 */
     if ((mem_limit && mem_malloced + len > mem_limit && p->slabs > 0) ||
         (grow_slab_list(id) == 0) ||
         ((ptr = memory_allocate((size_t)len)) == 0)) {
@@ -277,36 +313,56 @@ static int do_slabs_newslab(const unsigned int id) {
         return 0;
     }
 
+	/* 新分配的slab内存初始化为0 */
     memset(ptr, 0, (size_t)len);
+	
+	/* 将刚分配的slab划分为perslab个item(chunk), 并链接到空闲链表中 */
     split_slab_page_into_freelist(ptr, id);
 
+	/* 安插新分配的slab地址到slab_list数组中 */
     p->slab_list[p->slabs++] = ptr;
+	
+	/* 增加memcached系统已经分配的内存大小 */
     mem_malloced += len;
     MEMCACHED_SLABS_SLABCLASS_ALLOCATE(id);
 
     return 1;
 }
 
-/*@null@*/
-static void *do_slabs_alloc(const size_t size, unsigned int id) {
+/***
+ * 从指定的 slabclass, 即 slabclass[id], 分配大小为 size 的内存块供申请者使用
+ * @size[IN]: 向slabclass申请的内存大小
+ * @id[IN]: 指定slabclass
+ * @return: 成功返回申请到的内存的地址, 失败则返回NULL
+ */
+static void *do_slabs_alloc(const size_t size, unsigned int id) 
+{
     slabclass_t *p;
     void *ret = NULL;
     item *it = NULL;
 
+	/* ID索引必须在最小和最大的索引之间, 否则失败 */
     if (id < POWER_SMALLEST || id > power_largest) {
         MEMCACHED_SLABS_ALLOCATE_FAILED(size, 0);
         return NULL;
     }
 
+	/* 定位到id对应的slabclass项 */
     p = &slabclass[id];
+	
+	/**/
     assert(p->sl_curr == 0 || ((item *)p->slots)->slabs_clsid == 0);
 
     /* fail unless we have space at the end of a recently allocated page,
        we have something on our freelist, or we could allocate a new page */
+	   
+	/* 如果回收的空闲链表不为空, 或者可以分配新的slab, 否则执行失败 */
     if (! (p->sl_curr != 0 || do_slabs_newslab(id) != 0)) {
         /* We don't have more memory available */
         ret = NULL;
-    } else if (p->sl_curr != 0) {
+    } 
+	else if (p->sl_curr != 0) { /* 如果空闲链表中有回收的item, 则直接使用回收空闲链表中链表头的item(Chunk) */
+			
         /* return off our freelist */
         it = (item *)p->slots;
         p->slots = it->next;
@@ -315,17 +371,22 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
         ret = (void *)it;
     }
 
+	/*如果成功分配, 该slabclass被申请的内存数量增加size */
     if (ret) {
         p->requested += size;
         MEMCACHED_SLABS_ALLOCATE(size, id, p->size, ret);
-    } else {
+    } else { /* 否则就是失败了 */
         MEMCACHED_SLABS_ALLOCATE_FAILED(size, id);
     }
 
     return ret;
 }
 
-static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
+/* 回收内存到slabclass中 
+ *
+ */
+static void do_slabs_free(void *ptr, const size_t size, unsigned int id) 
+{
     slabclass_t *p;
     item *it;
 
@@ -337,6 +398,7 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
     MEMCACHED_SLABS_FREE(size, id, ptr);
     p = &slabclass[id];
 
+	/* 将回收的Item放在回收空闲链表的头部 */
     it = (item *)ptr;
     it->it_flags |= ITEM_SLABBED;
     it->prev = 0;
@@ -344,7 +406,10 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
     if (it->next) it->next->prev = it;
     p->slots = it;
 
+	/*回收空闲链表大小递增1 */
     p->sl_curr++;
+	
+	/* 向此slabclass申请的内存数将去size */
     p->requested -= size;
     return;
 }
@@ -439,28 +504,44 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
     add_stats(NULL, 0, NULL, 0, c);
 }
 
-static void *memory_allocate(size_t size) {
+/**** 
+ * memcached内部使用的请求size大小的内存
+ * 它要么直接malloc向系统申请, 要么从memcached预分配的大内存中申请, 关键看初始化时有没有指定prealloc标记
+ * 显然, 后者的效率更高, 但有可能也会让费空间
+ * @size[IN]: 要申请的内存大小
+ * @return: 新分配的内存空间地址
+ */
+static void *memory_allocate(size_t size) 
+{
     void *ret;
 
+	/* 如果初始化时未指定预先分配标志, 则没有预先分配大内存, 所以需要直接调用malloc分配所需的内存 */
     if (mem_base == NULL) {
         /* We are not using a preallocated large memory chunk */
         ret = malloc(size);
     } else {
+	
+		/* 如果预先分配了大内存, 则直接在大内存上从mem_current处取出需要的内存 */
         ret = mem_current;
 
+		/* 如果请求的本次请求的内存大于memcached剩余的预分配内存数, 则分配失败, 返回NULL */
         if (size > mem_avail) {
             return NULL;
         }
 
         /* mem_current pointer _must_ be aligned!!! */
+		/* 如果请求的size不是按要求对其的, 则调整size到8字节对齐 */
         if (size % CHUNK_ALIGN_BYTES) {
             size += CHUNK_ALIGN_BYTES - (size % CHUNK_ALIGN_BYTES);
         }
 
+		/* 将当前本次分配的内存实际大小累加到mem_current上, 这个簿记操作主要是标识下次从何处分配 */
         mem_current = ((char*)mem_current) + size;
+		
+		/* 相应地将剩余内存数减少 */
         if (size < mem_avail) {
             mem_avail -= size;
-        } else {
+        } else { /* 如果对齐后的size大于memcached中剩余的预分配内存, 则mem_avail设为0 */
             mem_avail = 0;
         }
     }
@@ -468,18 +549,39 @@ static void *memory_allocate(size_t size) {
     return ret;
 }
 
+/***
+ * 向memcached申请size大小的内存
+ * @id[IN]: 请求的内存大小
+ * @id[IN]: 指定的clsid, 用于索引slabclass
+ * @return: 成功返回内存的地址, 失败返回0(NULL)
+ */
 void *slabs_alloc(size_t size, unsigned int id) {
     void *ret;
 
+	/* 该函数是thread-safe的 */
     pthread_mutex_lock(&slabs_lock);
+	
+	/* 调用内部的分配内存函数 */
     ret = do_slabs_alloc(size, id);
+	
     pthread_mutex_unlock(&slabs_lock);
     return ret;
 }
 
-void slabs_free(void *ptr, size_t size, unsigned int id) {
+/***
+ * 释放ptr指向的大小为size的内存区域, 即将其加入slabclass[id]的空闲内存块数组(freelist)中
+ * @ptr[IN]: 要释放的内存
+ * @size[IN]: 内存的大小
+ * @id[IN]: 指定的clsid, 用于索引slabclass
+ */
+void slabs_free(void *ptr, size_t size, unsigned int id) 
+{
+	/* 该函数是thread-safe的 */
     pthread_mutex_lock(&slabs_lock);
+	
+	/* 调用内部的分配内存函数 */
     do_slabs_free(ptr, size, id);
+	
     pthread_mutex_unlock(&slabs_lock);
 }
 

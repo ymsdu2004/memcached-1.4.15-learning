@@ -30,6 +30,9 @@ of such data (either a client or a server) will always know, from a
 preceding text line, the exact length of the data block being
 transmitted.
 
+memcached协议中有两种数据, 一类是文本行, 一类是非结构化数据; 文本行用于
+客户端的命令以及服务端的相应字段; 非结构化数据一般用于表示存取的数据部分
+
 Text lines are always terminated by \r\n. Unstructured data is _also_
 terminated by \r\n, even though \r, \n or any other 8-bit characters
 may also appear inside the data. Therefore, when a client retrieves
@@ -37,6 +40,10 @@ data from a server, it must use the length of the data block (which it
 will be provided with) to determine where the data block ends, and not
 the fact that \r\n follows the end of the data block, even though it
 does.
+
+文本行和非结构化数据都是以\r\n结尾的, 但是对于非结构化数据, 由于数据本身就可能包含
+这些字符, 所以不能依赖\r\n来判断非结构化数据的结尾, 而应该根据它之前的数据长度字段
+来确定非结构化数据的结束边界
 
 Keys
 ----
@@ -48,16 +55,25 @@ length limit of a key is set at 250 characters (of course, normally
 clients wouldn't need to use such long keys); the key must not include
 control characters or whitespace.
 
+通过Key存取Value, Key是一个唯一标识特定数据的文本字符串, Key最大长度不超过
+250个字符, Key中字符不能包含控制或空白字符
+
 Commands
 --------
 
 There are three types of commands.
+
+一共有三种类型的命令
 
 Storage commands (there are six: "set", "add", "replace", "append"
 "prepend" and "cas") ask the server to store some data identified by a
 key. The client sends a command line, and then a data block; after
 that the client expects one line of response, which will indicate
 success or failure.
+
+存储命令有六个: set, add, replace, append, prepend以及cas, 客户端使用这些命令
+让服务器存储由key标识的数据; 客户端发送命令行, 紧接着一个数据块, 之后客户端会
+收到服务器的一个回复, 成功或者失败
 
 Retrieval commands (there are two: "get" and "gets") ask the server to
 retrieve data corresponding to a set of keys (one or more keys in one
@@ -67,16 +83,27 @@ the client one response line with information about the item, and one
 data block with the item's data; this continues until the server
 finished with the "END" response line.
 
+获取命令有两个: get和gets, 客户端使用这些命令要求服务器返回某个或者一组key
+对应的数据. 客户端发送一个命令行, 里面包含所有要请求的key值, 之后, 服务器针对
+每个key返回对应的数据项, 每次返回一个数据项, 直到返回"END"行, 标识响应的结束
+
 All other commands don't involve unstructured data. In all of them,
 the client sends one command line, and expects (depending on the
 command) either one line of response, or several lines of response
 ending with "END" on the last line.
 
+除了上面两类命令, 其他的命令都不涉及到非结构化数据, 这些命令都是客户端发送一个命令行, 
+然后服务器根据请求, 返回一个或者多个响应, 直到"END"行标识响应结束
+
 A command line always starts with the name of the command, followed by
 parameters (if any) delimited by whitespace. Command names are
 lower-case and are case-sensitive.
 
-Expiration times
+一个命令行总是以命令的名称开头, 紧跟着由空白字符分隔的参数(如果存在参数), 命令名称
+都是小写的, 并且是大小写敏感的
+
+Expiration times 
+超时时间
 ----------------
 
 Some commands involve a client sending some kind of expiration time
@@ -89,22 +116,34 @@ of seconds in 30 days); if the number sent by a client is larger than
 that, the server will consider it to be real Unix time value rather
 than an offset from current time.
 
+一些命令需要客户端传入超时的时间(比如数据项的过期时间或者命令请求的超时时间),
+传入的时间值要么是UTC时间戳(绝对时间)或者是从现在开始计时的相对时间. 对于后者(也就是相对时间),
+值的大小不能超过60*60*24*30秒(也就是30天), 如果时间值大于这个值, 则表示使用的是UTC绝对时间, 而
+非相对时间
+
 
 Error strings
+错误信息字符串
 -------------
 
 Each command sent by a client may be answered with an error string
 from the server. These error strings come in three types:
 
+客户端请求的每个命令都可能得到服务器错误信息的回复, 这些错误字符串信息主要有以下三种类型
+
 - "ERROR\r\n"
 
   means the client sent a nonexistent command name.
+  
+  表示客户端发送的命令不存在
 
 - "CLIENT_ERROR <error>\r\n"
 
   means some sort of client error in the input line, i.e. the input
   doesn't conform to the protocol in some way. <error> is a
   human-readable error string.
+  
+  表示客户端发送的命令信息与memcached协议不符合, <error>部分会说明具体的错误信息
 
 - "SERVER_ERROR <error>\r\n"
 
@@ -114,43 +153,63 @@ from the server. These error strings come in three types:
   serving the client (this shouldn't normally happen), the server will
   close the connection after sending the error line. This is the only
   case in which the server closes a connection to a client.
+  
+  表示由于服务器的某种错误导致命令无法执行, <error>部分包含了具体的错误原因.
+  对于服务器严重的错误(当然这种情况一般很难出现), 服务器会在发送完错误响应后关闭
+  与该客户端的连接. 这也是服务器关闭客户端连接的唯一可能出现的情况
+  
 
 
 In the descriptions of individual commands below, these error lines
 are not again specifically mentioned, but clients must allow for their
 possibility.
 
+客户端必须处理可能出现的各种错误响应
+
 
 Storage commands
+存储命令
 ----------------
 
 First, the client sends a command line which looks like this:
 
 <command name> <key> <flags> <exptime> <bytes> [noreply]\r\n
 cas <key> <flags> <exptime> <bytes> <cas unique> [noreply]\r\n
+<> 表示必选参数, [] 表示可选参数
 
 - <command name> is "set", "add", "replace", "append" or "prepend"
+- 命令名称
 
   "set" means "store this data".
+  "set"命令表述存储数据, 不管该key对应的数据项是否存在, 直接将该key对应的数据项设置为本次操作的结果
 
   "add" means "store this data, but only if the server *doesn't* already
   hold data for this key".
+  "add"表示存储数据, 但是仅在服务器没有该key对应的数据项时使用
 
   "replace" means "store this data, but only if the server *does*
   already hold data for this key".
+  "replace"也表示存储数据, 但是仅在服务器已经存在该key对应的数据项时使用
 
   "append" means "add this data to an existing key after existing data".
+  "append"表示追加新数据到已经存在的key对应的数据后面
 
   "prepend" means "add this data to an existing key before existing data".
+  "prepend"表示追加数据到已经存在的key对应的数据前面
 
   The append and prepend commands do not accept flags or exptime.
   They update existing data portions, and ignore new flag and exptime
   settings.
+  "append"和"prepend"命令不接受falgs和exptime参数. 它们仅仅更新已有的数据组成,
+  如果给出了这些参数会被忽略
 
   "cas" is a check and set operation which means "store this data but
   only if no one else has updated since I last fetched it."
+  "cas"命令用于检查性地执行set操作, 它只有在自它上次访问该数据后, 没有任何人更新过该数据时才会执行set操作
+  这是一个安全set命令, 避免覆盖别人修改的数据
 
 - <key> is the key under which the client asks to store the data
+- 键名 表示客户端要将数据存储在谁的名下, 也就是典型的key-value
 
 - <flags> is an arbitrary 16-bit unsigned integer (written out in
   decimal) that the server stores along with the data and sends back
@@ -159,6 +218,11 @@ cas <key> <flags> <exptime> <bytes> <cas unique> [noreply]\r\n
   Note that in memcached 1.2.1 and higher, flags may be 32-bits, instead
   of 16, but you might want to restrict yourself to 16 bits for
   compatibility with older versions.
+- flags 它是一个16位的无符号整形数字(以十进制的形式表示), 该数字与数据一块存储,
+  并且在客户端获取数据项时与数据一块返回. 客户端可以使用这个flag当成一组位域来使用, 
+  以保存数据相关的一些信息; 这些flags信息对服务器来讲是透明的.
+  注意: 在memcached1.2.1及之后的版本, flags是32位的值, 而非16位, 但是为了兼容之前的
+  版本, 客户端最后限制使用16位.
 
 - <exptime> is expiration time. If it's 0, the item never expires
   (although it may be deleted from the cache to make place for other
@@ -166,53 +230,82 @@ cas <key> <flags> <exptime> <bytes> <cas unique> [noreply]\r\n
   current time), it is guaranteed that clients will not be able to
   retrieve this item after the expiration time arrives (measured by
   server time).
-
+- <exptime> 用于指定过期时间. 如果该参数设置为0, 则表示从不过期. 如果是个
+  非0值(绝对UTC时间或者距离当前的未来相对时间), 它保证在过期后客户端不可能获取
+  到相应的数据项(时间是由服务器时间来度量的)
+  
 - <bytes> is the number of bytes in the data block to follow, *not*
   including the delimiting \r\n. <bytes> may be zero (in which case
   it's followed by an empty data block).
+- <bytes> 用于指定接下来的数据行的数据长度, 这个长度是不包含结束符\r\n的(前面说到, 非结构化数据
+  也是以\r\n结尾的, 尽管你不能依靠它来确定数据是结束)
 
 - <cas unique> is a unique 64-bit value of an existing entry.
   Clients should use the value returned from the "gets" command
   when issuing "cas" updates.
+- <cas unique> 是一个关联memcached中某个已有条目的唯一的64位的值.
+  客户端执行cas命令前需要执行"gets"命令来获取对应项的这个值
 
 - "noreply" optional parameter instructs the server to not send the
   reply.  NOTE: if the request line is malformed, the server can't
   parse "noreply" option reliably.  In this case it may send the error
   to the client, and not reading it on the client side will break
   things.  Client should construct only valid requests.
+- "noreply" 可选参数用来告知服务器不要对此命令返回任何回复
+  注意: 如果客户端的命令格式错误, 则服务器肯定无法可靠地解析到"noreply"参数,
+  这种情况下服务端就可能将错误信息发送给客户端, 由此可能给客户端造成一些麻烦,
+  所以使用这个参数的时候, 务必保证你的命令格式是合法的
 
 After this line, the client sends the data block:
+
+命令行之后, 跟着的就是客户端要发送的数据块, 其格式如下
 
 <data block>\r\n
 
 - <data block> is a chunk of arbitrary 8-bit data of length <bytes>
   from the previous line.
+- <data block> 指定由命令行中bytes参数指定长度的任意数据
 
 After sending the command line and the data blockm the client awaits
 the reply, which may be:
 
+客户端发送命令行和数据块之后, 就等待着服务端的回复, 可能的恢复包括以下几种:
+
 - "STORED\r\n", to indicate success.
+
+- "STORED\r\n", 指示存储成功.
 
 - "NOT_STORED\r\n" to indicate the data was not stored, but not
 because of an error. This normally means that the
 condition for an "add" or a "replace" command wasn't met.
 
+- "NOT_STORED\r\n" 指示数据没有被存储, 但不是因为发生了错误(发生错误返回ERROR),
+  这种情况往往意味着"add"和"replace"命令执行的条件未满足(比如执行add的时候, 对应的key已经存在,
+  或者执行replace的时候对应的key不存在).
+  
 - "EXISTS\r\n" to indicate that the item you are trying to store with
 a "cas" command has been modified since you last fetched it.
+
+- "EXISTS\r\n" 指示客户端使用cas命令尝试存储的key自其上次获取该值后已经被修改过
 
 - "NOT_FOUND\r\n" to indicate that the item you are trying to store
 with a "cas" command did not exist.
 
+- "NOT_FOUND\r\n" 指示客户端使用cas命令尝试存储的key对应的项不存在
+
 
 Retrieval command:
+检索命令
 ------------------
 
 The retrieval commands "get" and "gets" operates like this:
+检索命令"get"和"gets"命令的格式如下:
 
 get <key>*\r\n
 gets <key>*\r\n
 
 - <key>* means one or more key strings separated by whitespace.
+- <key>* 表示一个或多个空白字符串分割的key字符串
 
 After this command, the client expects zero or more items, each of
 which is received as a text line followed by a data block. After all
@@ -222,22 +315,37 @@ the items have been transmitted, the server sends the string
 
 to indicate the end of response.
 
+命令执行后, 客户端将得到0条或者多条回复, 每条回复都是一个命令行紧接着一个数据块.
+当所有对应的条目回复完成后, 会恢复一条"END\r\n"命令行, 指示本条检索命令回复完毕.
+
 Each item sent by the server looks like this:
+
+服务器返回的每个条目格式如下: 
 
 VALUE <key> <flags> <bytes> [<cas unique>]\r\n
 <data block>\r\n
 
 - <key> is the key for the item being sent
 
+- <key> 表示此条目的key
+
 - <flags> is the flags value set by the storage command
+
+- <flags> 是客户端存储该条目时指定的flags
 
 - <bytes> is the length of the data block to follow, *not* including
   its delimiting \r\n
+  
+- <bytes> 指示后面紧跟着的数据块的长度(字节), 不包换数据块结束符\r\n
 
 - <cas unique> is a unique 64-bit integer that uniquely identifies
   this specific item.
+  
+- <cas unique> memcached中用于标识此条目的全局唯一的64位整数
 
 - <data block> is the data for this item.
+
+- <data block> 是此条目对应的数据
 
 If some of the keys appearing in a retrieval request are not sent back
 by the server in the item list this means that the server does not
@@ -245,32 +353,49 @@ hold items with such keys (because they were never stored, or stored
 but deleted to make space for more items, or expired, or explicitly
 deleted by a client).
 
+如果返回的条目中某些请求的key没有出现, 则说明服务器中不存在该key对应的条目(可能的原因有:
+服务器根本就未曾存储过该条目、由于空间不足被服务器删除了、过期了或者被客户端删除过).
+
 
 Deletion
+删除命令
 --------
 
 The command "delete" allows for explicit deletion of items:
+
+"delete"命令用于客户端主动删除相应的条目(前面提到过服务端可能会自己删除某些条目), 其格式如下：
 
 delete <key> [noreply]\r\n
 
 - <key> is the key of the item the client wishes the server to delete
 
+- <key> 希望服务器删除的条目的key值
+
 - "noreply" optional parameter instructs the server to not send the
   reply.  See the note in Storage commands regarding malformed
   requests.
+  
+- "npreply" 可选参数指示服务器不要发送命令回复
 
 The response line to this command can be one of:
 
+删除命令的回复行可能是以下几种之一:
+
 - "DELETED\r\n" to indicate success
+
+- "DELETED\r\n" 表示删除成功
 
 - "NOT_FOUND\r\n" to indicate that the item with this key was not
   found.
+  
+- "NOT_FOUND\r\n" 表示希望删除key对应的条目根本不存在
 
 See the "flush_all" command below for immediate invalidation
 of all existing items.
 
 
 Increment/Decrement
+数据递增/递减命令
 -------------------
 
 Commands "incr" and "decr" are used to change data for some item
@@ -282,7 +407,14 @@ bogus value as if it were 0, leading to confusing). Also, the item
 must already exist for incr/decr to work; these commands won't pretend
 that a non-existent key exists with value 0; instead, they will fail.
 
+命令"incr"和"decr"用于原地更新某些条目, 即增加或者减小值. 这些条目被当做一个64位
+的十进制形式的无符号整数, 如果操作的条目数据不满足这一条件, 则incr/decr命令将返回错误,
+memcached低于1.2.6的版本对这种情况的处理是将其当成0, 显然这将导致数据的混乱. 另外,
+这两个命令操作的条目必须存在才能正常工作, 服务器不会将不存在的key对应的项当成0处理, 而是返回错误
+
 The client sends the command line:
+
+命令格式如下:
 
 incr <key> <value> [noreply]\r\n
 
@@ -292,56 +424,91 @@ decr <key> <value> [noreply]\r\n
 
 - <key> is the key of the item the client wishes to change
 
+- <key> 指示希望变更值的条目对应的key
+
 - <value> is the amount by which the client wants to increase/decrease
 the item. It is a decimal representation of a 64-bit unsigned integer.
+
+- <value> 指示客户端希望将key对应的条目的值递增/递减多少, 这是一个十进制表示的64位的无符号整数
 
 - "noreply" optional parameter instructs the server to not send the
   reply.  See the note in Storage commands regarding malformed
   requests.
+  
+- "norelpy"可选参数指示服务器不必对该条命令做任何回复
 
 The response will be one of:
 
+递增/递减命令的恢复可能有以下几种:
+
 - "NOT_FOUND\r\n" to indicate the item with this value was not found
+
+- "NOT_FOUND\r\n"表示key对应的条目不存在
 
 - <value>\r\n , where <value> is the new value of the item's data,
   after the increment/decrement operation was carried out.
+  
+- "<value>\r\n", 表示命令执行成功, <value>是数据变更后的新值
 
 Note that underflow in the "decr" command is caught: if a client tries
 to decrease the value below 0, the new value will be 0.  Overflow in
 the "incr" command will wrap around the 64 bit mark.
+
+注意: 由于数据被当做64位的无符号整数, 所以如果"decr"命令导致数据向下溢出, 则新值会
+设置为0, 如果命令"incr"导致数据上溢, 则会导致符号位置1
 
 Note also that decrementing a number such that it loses length isn't
 guaranteed to decrement its returned length.  The number MAY be
 space-padded at the end, but this is purely an implementation
 optimization, so you also shouldn't rely on that.
 
+另外需要注意的是: 
+
 Touch
+Touch命令
 -----
 
 The "touch" command is used to update the expiration time of an existing item
 without fetching it.
 
+"touch"命令用于在不取其值的情况下更新条目的过期时间, 其格式如下:
+
 touch <key> <exptime> [noreply]\r\n
 
 - <key> is the key of the item the client wishes the server to delete
+
+- <key> 指示需要更新过期时间的条目对应的key
 
 - <exptime> is expiration time. Works the same as with the update commands
   (set/add/etc). This replaces the existing expiration time. If an existing
   item were to expire in 10 seconds, but then was touched with an
   expiration time of "20", the item would then expire in 20 seconds.
+  
+- <exptime> 指示条目的过期时间. 取值与上面的更新命令(如add)相同. 命令执行成功会将新
+的过期时间替换旧的过期时间. 比如, 如果当前条目的过期将会在10秒内发生, 此时如果使用touch命令将
+其更新为20, 则此条目将会在20秒之后过期
 
 - "noreply" optional parameter instructs the server to not send the
   reply.  See the note in Storage commands regarding malformed
   requests.
+  
+- "noreply"可选参数指示服务器不必对此命令做出回复
 
 The response line to this command can be one of:
 
+此命令的恢复行有以下几种情况:
+
 - "TOUCHED\r\n" to indicate success
+
+- "TOUCHED\r\n"指示命令执行成功
 
 - "NOT_FOUND\r\n" to indicate that the item with this key was not
   found.
+  
+- "NOT_FOUND\r\n"指示操作的key不存在
 
 Slabs Reassign
+Slab也大小重置命令
 --------------
 
 NOTE: This command is subject to change as of this writing.
