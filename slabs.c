@@ -110,20 +110,20 @@ static void slabs_preallocate (const unsigned int maxslabs);
  */
 
 /***
- * 返回给定大小的对象(chunk大小)应该存储在slabclass数组中的索引
+ * 返回给定大小的对象(chunk大小)应该存储在slabclass数组中的索引,即确定其属于哪种slabclass
  * @size[IN]: 需要存储的对象的大小
- * @return: 成功则返回相应slabclass的索引, 失败则返回0, slabclass数组中的0索引是不使用的
+ * @return: 成功则返回相应slabclass的索引([1, power_largest)), 失败则返回0, slabclass数组中的0索引是不使用的
  */
 unsigned int slabs_clsid(const size_t size) {
     int res = POWER_SMALLEST;
 
-	/* 如果传入的对象size为0, 则直接返回0 */
+	/* 如果传入的对象size为0, 则直接返回0, 查找失败 */
     if (size == 0)
         return 0;
 		
 	/* 逐个遍历slabclass, 最适合size大小对象的slabclass(即不小于size的拥有最小chunk尺寸的slabclass) */
     while (size > slabclass[res].size)
-		/* 请求的对象内存过大, 超过了拥有最大Chunk尺寸的slabclass, 当前memcached的设置条件无法满足 */
+		/* 请求的对象内存过大, 超过了拥有最大Chunk尺寸的slabclass, 当前slab子系统的设置条件无法满足 */
         if (res++ == power_largest)     /* won't fit in the biggest slab */
             return 0;
 			
@@ -132,28 +132,32 @@ unsigned int slabs_clsid(const size_t size) {
 }
 
 /**
+ * 初始化slab子系统, 初始化slabclass的各个参数, 决定各个slabclass的slab中chunk的大小, 每个slab拥有的chunk数以及有多少有效的slabclass
+ * @limit: slab子系统使用的内存最大限制
+ * @factor: slabclass中chunk大小的增长因子
+ * @prealloc: 是否预先一次性分配slab子系统的内存块，注意, 该标记不会保证成功, 预先分配能够提升性能
  * Determines the chunk sizes and initializes the slab class descriptors
  * accordingly.
  */
 void slabs_init(const size_t limit, const double factor, const bool prealloc) {
     int i = POWER_SMALLEST - 1;
 	
-	/* 初始chunk块大小, 每个Chunk块都有额外的item, 用于链表链接 */
+	/* 初始chunk块(也就是第一个slabclass的chunk)大小, 每个Chunk块都有额外的item, 用于链表链接 */
     unsigned int size = sizeof(item) + settings.chunk_size;
 
-	/* 用于限定memcached可分配的最大内存数 */
+	/* 用于限定slab子系统可分配的最大内存 */
     mem_limit = limit;
 
-	/* 如果指定了为memcached预先分配大内存的的标志 */
+	/* 如果指定了为slab子系统预先分配大内存的标志, 则先一次性分配该大内存, 如果预分配失败, 则降级处理（即不做prealloc优化） */
     if (prealloc) {
         /* Allocate everything in a big chunk with malloc */
 		
 		/* 调用malloc分配mem_limit大小的大内存块 */
         mem_base = malloc(mem_limit);
         if (mem_base != NULL) {
-            mem_current = mem_base;
-            mem_avail = mem_limit;
-        } else {
+            mem_current = mem_base; /* 新分配大内存还未使用, 所以当前可用内存地址为整块大内存的首地址 */
+            mem_avail = mem_limit; /* 可用内存数此时还是满的 */
+        } else { /* 预先分配大内存失败也不会导致系统推出, 仅仅是做降级处理, 并打印告警信息 */
             fprintf(stderr, "Warning: Failed to allocate requested memory in"
                     " one large chunk.\nWill allocate in smaller chunks\n");
         }
@@ -162,36 +166,40 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc) {
 	/* 索引0对应的元素不使用, 所以将其所有字段初始化为0 */
     memset(slabclass, 0, sizeof(slabclass));
 
-	/* 初始化每个slabclass */
+	/* 初始化每个slabclass
+	 * 如果发现计算出来的chunk大小超过了slab系统中单个slab的大小, 则对应的slabclass及其之后的slabclass都不会初始化
+	 */
     while (++i < POWER_LARGEST && size <= settings.item_size_max / factor) {
         /* Make sure items are always n-byte aligned */
 		
-		/* 将就算的chunk块大小调整为按给定字节对其 */
+		/* 如果size大小指示的chunk块大小没有CHUNK_ALIGN_BYTES对齐, 则将size调整为按给定字节向上对齐 */
         if (size % CHUNK_ALIGN_BYTES)
             size += CHUNK_ALIGN_BYTES - (size % CHUNK_ALIGN_BYTES);
 
 		/* 最终该slabclass中每个chunk块的大小 */
         slabclass[i].size = size;
 		
-		/* 每个slab中包含的chunk块数量, item_size_max是slab整个slab对应的完整内存块的大小 */
+		/* 每个slab中包含的chunk块数量, item_size_max是单个slab的大小，每个slabclass的slab大小是一样的, 但chunk大小不一样 */
         slabclass[i].perslab = settings.item_size_max / slabclass[i].size;
 		
 		/* 下一个slabclass的chunk大小是上一个slabclass的chunk大小的factor倍 */
         size *= factor;
+        
+        /* 配置参数设置了verbose则打印初始化slabclass的详细信息, 记录每个slabclass的chunk块大小及其单个slab中chunk的数量 */
         if (settings.verbose > 1) {
             fprintf(stderr, "slab class %3d: chunk size %9u perslab %7u\n",
                     i, slabclass[i].size, slabclass[i].perslab);
         }
     }
 
-	/* 对大的chunk块对应的slabclass */
+	/***
+	 * while条件退出时, i满足：i<POWER_LARGEST, 这个作为最后一个有效的slabclass,
+	 * 它的chunk大小就是整个slab的大小, 也就意味着这个slabclass的每个slab仅有一个chunk
+	 */
     power_largest = i;
-	
-	/* 它对应的chunk的大小为item_size_max */
     slabclass[power_largest].size = settings.item_size_max;
-	
-	/* 它的每个slab只有一个chunk块 */
     slabclass[power_largest].perslab = 1;
+    
     if (settings.verbose > 1) {
         fprintf(stderr, "slab class %3d: chunk size %9u perslab %7u\n",
                 i, slabclass[i].size, slabclass[i].perslab);
@@ -215,6 +223,7 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc) {
 
 /***
  * 为每个slabclass预先分配一个slab
+ * @maxslabs: slabs_init决定的slab系统最大有效的slabclass索引
  */
 static void slabs_preallocate (const unsigned int maxslabs) {
     int i;
@@ -232,6 +241,8 @@ static void slabs_preallocate (const unsigned int maxslabs) {
     for (i = POWER_SMALLEST; i <= POWER_LARGEST; i++) {
         if (++prealloc > maxslabs)
             return;
+            
+            /* 为索引为i的slabclass分配一个slab， 任何一个失败则退出进程 */
         if (do_slabs_newslab(i) == 0) {
             fprintf(stderr, "Error while preallocating slab memory!\n"
                 "If using -L or other prealloc options, max memory must be "
@@ -270,12 +281,16 @@ static int grow_slab_list (const unsigned int id) {
 
 /***
  * 将新分配的一个完整slab页分割并加链接到空闲链表中
+ * @ptr: 新分配的slab的地址
+ * @id: 该slabclass的索引
  */
 static void split_slab_page_into_freelist(char *ptr, const unsigned int id) {
     slabclass_t *p = &slabclass[id];
     int x;
 	
-	/* 该slab页总共划分为perslab个chunk, 每个chunk通过item链接成一个链表 */
+	/* 该slab页总共划分为perslab个chunk, 
+	 * 即将完整的slab内存块item对象化, 并将这些item链接成一个链表
+	 **/
     for (x = 0; x < p->perslab; x++) {
 	
 		/* 将ptr指定的item(含chunk)链接到空闲链表中 */
@@ -288,7 +303,7 @@ static void split_slab_page_into_freelist(char *ptr, const unsigned int id) {
 
 /***
  * 为slabclass[id]分配slab内存, 当slabclass的slab用尽的时候, 调用该函数
- * 为该slabclass非配一个新的slab
+ * 为该slabclass增加一个新的slab
  */
 static int do_slabs_newslab(const unsigned int id) {
 
@@ -322,7 +337,7 @@ static int do_slabs_newslab(const unsigned int id) {
 	/* 安插新分配的slab地址到slab_list数组中 */
     p->slab_list[p->slabs++] = ptr;
 	
-	/* 增加memcached系统已经分配的内存大小 */
+	/* 增加slab子系统已经分配的内存大小 */
     mem_malloced += len;
     MEMCACHED_SLABS_SLABCLASS_ALLOCATE(id);
 
@@ -382,15 +397,23 @@ static void *do_slabs_alloc(const size_t size, unsigned int id)
     return ret;
 }
 
-/* 回收内存到slabclass中 
- *
+/* 回收内存到slabclass的空闲item链表中 
+ * @ptr: item的首地址
+ * @size:
+ * @id: 该slab所属的slabclass的索引
  */
 static void do_slabs_free(void *ptr, const size_t size, unsigned int id) 
 {
     slabclass_t *p;
     item *it;
 
+	/* 这里是assert回收item的前置条件
+	 * 回收该item的条件: 新分配的slab刚刚切分为新的item(此时item对象还未初始化, 所以slabs_clsid = 0)
+	 * 或者: 已经使用的item被释放了, 其slabs_clsid也被设置为0了
+	 */
     assert(((item *)ptr)->slabs_clsid == 0);
+    
+    /* 正常情况下调用该函数的id一定是有效的slabclass的索引, 如果不是的话则什么也不做 */
     assert(id >= POWER_SMALLEST && id <= power_largest);
     if (id < POWER_SMALLEST || id > power_largest)
         return;
@@ -398,7 +421,7 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id)
     MEMCACHED_SLABS_FREE(size, id, ptr);
     p = &slabclass[id];
 
-	/* 将回收的Item放在回收空闲链表的头部 */
+	/* 将回收的Item放在回收空闲双向链表的头部 */
     it = (item *)ptr;
     it->it_flags |= ITEM_SLABBED;
     it->prev = 0;
