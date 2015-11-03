@@ -60,16 +60,16 @@ typedef struct {
 /* 索引0对应的元素不使用 */
 static slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
 
-/* memcached限制的最大使用内存数, 在slabs_init中设置, 如果该值设为0, 则不限制 */
+/* slab子系统限制的最大使用内存, 在slabs_init中设置, 如果该值设为0, 则不限制 */
 static size_t mem_limit = 0;
 
-/* memcached系统已经分配出去的内存大小 */
+/* slab子系统已经分配出去的内存大小 */
 static size_t mem_malloced = 0;
 
 /* slabclass的最大索引号 */
 static int power_largest;
 
-/* 预先分配的memcached整个大内存块的地址 */
+/* 预先分配的slab子系统整个大内存块的地址 */
 static void *mem_base = NULL;
 
 /* 预先分配的大内存块下次分配空间的起始地址 */
