@@ -346,6 +346,7 @@ static int do_slabs_newslab(const unsigned int id) {
 
 /***
  * 从指定的 slabclass, 即 slabclass[id], 分配大小为 size 的内存块供申请者使用
+ * 调用这个函数的前提条件: 确保chunk的大小不小于size
  * @size[IN]: 向slabclass申请的内存大小
  * @id[IN]: 指定slabclass
  * @return: 成功返回申请到的内存的地址, 失败则返回NULL
@@ -371,7 +372,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id)
     /* fail unless we have space at the end of a recently allocated page,
        we have something on our freelist, or we could allocate a new page */
 	   
-	/* 如果回收的空闲链表不为空, 或者可以分配新的slab, 否则执行失败 */
+	/* 如果回收的空闲链表为空, 并且也没法分配新的slab给此slabclass, 则向slab系统申请内存执行失败 */
     if (! (p->sl_curr != 0 || do_slabs_newslab(id) != 0)) {
         /* We don't have more memory available */
         ret = NULL;
@@ -379,6 +380,8 @@ static void *do_slabs_alloc(const size_t size, unsigned int id)
 	else if (p->sl_curr != 0) { /* 如果空闲链表中有回收的item, 则直接使用回收空闲链表中链表头的item(Chunk) */
 			
         /* return off our freelist */
+        
+        /* 空闲链表指针 */
         it = (item *)p->slots;
         p->slots = it->next;
         if (it->next) it->next->prev = 0;
@@ -553,7 +556,12 @@ static void *memory_allocate(size_t size)
         }
 
         /* mem_current pointer _must_ be aligned!!! */
-		/* 如果请求的size不是按要求对其的, 则调整size到8字节对齐 */
+		/* 如果请求的size不是按要求对其的, 则调整size到8字节对齐 
+		 * 这里你可能会存在疑问？为什么没有将上面判断size > mem_avail的if语句放在此句之后? 如果对齐后的size大于
+		 * mem_avail怎么办? 
+		 * 起始这里的担心是多余的, 因为我们的分配单位是chunk, 而且chunk是对齐到CHUNK_ALIGN_BYTES的, 所以当size小于
+		 * mem_avail必定会保证这样一个事实: size对齐到CHUNK_ALIGN_BYTES也会<=mem_avail
+		 */
         if (size % CHUNK_ALIGN_BYTES) {
             size += CHUNK_ALIGN_BYTES - (size % CHUNK_ALIGN_BYTES);
         }
@@ -564,7 +572,7 @@ static void *memory_allocate(size_t size)
 		/* 相应地将剩余内存数减少 */
         if (size < mem_avail) {
             mem_avail -= size;
-        } else { /* 如果对齐后的size大于memcached中剩余的预分配内存, 则mem_avail设为0 */
+        } else { /* 如果对齐后的size等于(这里绝不会大于)memcached中剩余的预分配内存, 则mem_avail设为0 */
             mem_avail = 0;
         }
     }
